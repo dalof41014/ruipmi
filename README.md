@@ -1,5 +1,9 @@
 # ruipmi
 
+[![Crates.io](https://img.shields.io/crates/v/ruipmi.svg)](https://crates.io/crates/ruipmi)
+[![Docs.rs](https://docs.rs/ruipmi/badge.svg)](https://docs.rs/ruipmi)
+[![License](https://img.shields.io/crates/l/ruipmi.svg)](https://github.com/dalof41014/ruipmi/blob/main/LICENSE-MIT)
+
 **`ruipmi`** is a minimal asynchronous **RMCP+ IPMI client** written in Rust.
 It implements the **IPMI v2.0 LAN+ session handshake** (Open Session + RAKP1–4) and provides encrypted message transmission over UDP using AES-CBC-128 and HMAC-SHA256 integrity/authentication.
 
