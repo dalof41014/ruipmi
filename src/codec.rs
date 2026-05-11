@@ -9,27 +9,20 @@ pub fn build_open_session_request(cipher: &CipherSuite, console_id: &[u8; 4]) ->
         RMCP_VERSION_1, 0x00, 0xFF, RMCP_CLASS_IPMI,
         SESSION_AUTHTYPE_RMCP_PLUS,
         PAYLOAD_TYPE_RMCP_OPEN_REQUEST,
-        0, 0, 0, 0, 0, 0, 0, 0, // sess/seq placeholder
-        0x20, 0x00, // payload size placeholder
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0x20, 0x00,
     ];
-    // [0x10..0x14] Message tag + max priv + reserved
     buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-    // [0x14..0x18] Console Session ID (placeholder, overwritten below)
     buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-    // [0x18..0x20] Authentication payload: type=0x00, reserved(2), len=0x08, alg, reserved(3)
     buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x08, 0x01, 0x00, 0x00, 0x00]);
-    // [0x20..0x28] Integrity payload: type=0x01, reserved(2), len=0x08, alg, reserved(3)
     buf.extend_from_slice(&[0x01, 0x00, 0x00, 0x08, 0x01, 0x00, 0x00, 0x00]);
-    // [0x28..0x30] Confidentiality payload: type=0x02, reserved(2), len=0x08, alg, reserved(3)
     buf.extend_from_slice(&[0x02, 0x00, 0x00, 0x08, 0x01, 0x00, 0x00, 0x00]);
 
-    // Fill actual values
     buf[0x14..0x18].copy_from_slice(console_id);
     buf[0x1C] = cipher.auth_byte();
     buf[0x24] = cipher.integrity_byte();
     buf[0x2C] = cipher.conf_byte();
 
-    // Payload size
     let plen = buf.len() - IPMI_LANPLUS_HEADER_LEN;
     buf[OFF_PAYLOAD_SIZE] = (plen & 0xFF) as u8;
     buf[OFF_PAYLOAD_SIZE + 1] = ((plen >> 8) & 0xFF) as u8;
@@ -46,9 +39,9 @@ pub fn build_rakp1(
         RMCP_VERSION_1, 0x00, 0xFF, RMCP_CLASS_IPMI,
         SESSION_AUTHTYPE_RMCP_PLUS,
         PAYLOAD_TYPE_RAKP_1,
-        0, 0, 0, 0, 0, 0, 0, 0, // sess/seq placeholder
-        0, 0, // payload size
-        0, 0, 0, 0, // message tag + reserved
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0,
+        0, 0, 0, 0,
     ];
     buf.extend_from_slice(bmc_id);
     buf.extend_from_slice(console_rand);
@@ -59,6 +52,71 @@ pub fn build_rakp1(
     buf[OFF_PAYLOAD_SIZE] = (plen & 0xFF) as u8;
     buf[OFF_PAYLOAD_SIZE + 1] = ((plen >> 8) & 0xFF) as u8;
     buf
+}
+
+/// Verify RAKP2 auth code from BMC.
+/// HMAC(password, SIDm || SIDc || Rm || Rc || GUIDc || ROLEm || ULENm || UNAMEm)
+pub fn verify_rakp2(
+    cipher: &CipherSuite,
+    password: &[u8],
+    console_id: &[u8; 4],
+    bmc_id: &[u8; 4],
+    console_rand: &[u8; 16],
+    bmc_rand: &[u8; 16],
+    bmc_guid: &[u8; 16],
+    username: &[u8],
+    received_auth_code: &[u8],
+) -> Result<()> {
+    let mut data = Vec::with_capacity(58 + username.len());
+    data.extend_from_slice(console_id);  // SIDm
+    data.extend_from_slice(bmc_id);      // SIDc
+    data.extend_from_slice(console_rand); // Rm
+    data.extend_from_slice(bmc_rand);    // Rc
+    data.extend_from_slice(bmc_guid);    // GUIDc
+    data.push(0x14);                     // ROLEm
+    data.push(username.len() as u8);     // ULENGTHm
+    data.extend_from_slice(username);    // UNAMEm
+
+    let expected = hmac_auth(cipher, password, &data);
+    if expected.len() < received_auth_code.len() {
+        return Err(IpmiError::AuthFailed);
+    }
+    if expected[..received_auth_code.len()] != *received_auth_code {
+        return Err(IpmiError::AuthFailed);
+    }
+    Ok(())
+}
+
+/// Verify RAKP4 integrity check value.
+/// HMAC(SIK, Rm || SIDc || GUIDc) truncated per auth algorithm.
+pub fn verify_rakp4(
+    cipher: &CipherSuite,
+    sik: &[u8],
+    console_rand: &[u8; 16],
+    bmc_id: &[u8; 4],
+    bmc_guid: &[u8; 16],
+    received_icv: &[u8],
+) -> Result<()> {
+    let mut data = Vec::with_capacity(36);
+    data.extend_from_slice(console_rand); // Rm
+    data.extend_from_slice(bmc_id);       // SIDc (BMC session ID)
+    data.extend_from_slice(bmc_guid);     // GUIDc
+
+    let full = hmac_auth(cipher, sik, &data);
+    // Truncate: SHA1->12, MD5->16, SHA256->16
+    let trunc_len = match cipher.authentication {
+        crate::cipher::AuthAlg::HmacSha1 => 12,
+        crate::cipher::AuthAlg::HmacMd5 => 16,
+        crate::cipher::AuthAlg::HmacSha256 => 16,
+        crate::cipher::AuthAlg::None => 0,
+    };
+    if trunc_len == 0 {
+        return Ok(());
+    }
+    if received_icv.len() != trunc_len || full[..trunc_len] != *received_icv {
+        return Err(IpmiError::AuthFailed);
+    }
+    Ok(())
 }
 
 /// Build RAKP Message 3 and derive session keys (SIK, K1, K2).
@@ -101,9 +159,9 @@ pub fn build_rakp3(
         RMCP_VERSION_1, 0x00, 0xFF, RMCP_CLASS_IPMI,
         SESSION_AUTHTYPE_RMCP_PLUS,
         PAYLOAD_TYPE_RAKP_3,
-        0, 0, 0, 0, 0, 0, 0, 0, // sess/seq
-        0, 0, // payload size
-        0, 0, 0, 0, // message tag + status + reserved
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0,
+        0, 0, 0, 0,
     ];
     buf.extend_from_slice(bmc_id);
     buf.extend_from_slice(&auth);
@@ -172,13 +230,13 @@ pub fn build_v2_encrypted_msg(
     Ok(msg)
 }
 
-/// Decode and decrypt an incoming IPMI v2 response.
+/// Decode and decrypt an incoming IPMI v2 response. Returns (sequence_number, payload).
 pub fn decode_and_decrypt(
     cipher: &CipherSuite,
     data: &[u8],
     k1: &[u8],
     k2: &[u8; 16],
-) -> Result<Vec<u8>> {
+) -> Result<(u32, Vec<u8>)> {
     if data.get(OFF_AUTHTYPE).copied() != Some(SESSION_AUTHTYPE_RMCP_PLUS) {
         return Err(IpmiError::BadResponse);
     }
@@ -196,6 +254,14 @@ pub fn decode_and_decrypt(
     if auth_calc != auth_recv {
         return Err(IpmiError::AuthFailed);
     }
+
+    // Extract sequence number
+    let seq = u32::from_le_bytes([
+        data[OFF_SEQUENCE_NUM],
+        data[OFF_SEQUENCE_NUM + 1],
+        data[OFF_SEQUENCE_NUM + 2],
+        data[OFF_SEQUENCE_NUM + 3],
+    ]);
 
     // Decrypt
     let msglen = (data[OFF_PAYLOAD_SIZE] as usize) | ((data[OFF_PAYLOAD_SIZE + 1] as usize) << 8);
@@ -230,7 +296,7 @@ pub fn decode_and_decrypt(
     if ipmi_payload.len() < 7 {
         return Err(IpmiError::BadResponse);
     }
-    Ok(ipmi_payload[6..ipmi_payload.len() - 1].to_vec())
+    Ok((seq, ipmi_payload[6..ipmi_payload.len() - 1].to_vec()))
 }
 
 /// Pack raw [netfn, cmd, data...] into IPMI inner message format.

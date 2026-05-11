@@ -1,16 +1,18 @@
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::net::UdpSocket;
+use tokio::net::{lookup_host, UdpSocket};
 use tokio::time::timeout;
 
-use log::{debug, error};
+use log::{debug, error, warn};
 
 use crate::cipher::{CipherSuite, DEFAULT_CIPHER_SUITE};
 use crate::codec;
 use crate::constants::*;
-use crate::crypto::rand_bytes_4;
-use crate::crypto::rand_bytes_16;
+use crate::crypto::{rand_bytes_4, rand_bytes_16};
 use crate::error::{IpmiError, Result};
+
+const MAX_RETRIES: u8 = 3;
+const SEQ_WINDOW: u32 = 32;
 
 pub struct IpmiClient {
     hostname: String,
@@ -21,11 +23,13 @@ pub struct IpmiClient {
     peer: SocketAddr,
 
     out_seq: u32,
+    in_seq: u32,
     rq_seq: u8,
     bmc_id: [u8; 4],
     console_id: [u8; 4],
     bmc_rand: [u8; 16],
     console_rand: [u8; 16],
+    bmc_guid: [u8; 16],
     sik: Vec<u8>,
     k1: Vec<u8>,
     k2: [u8; 16],
@@ -37,6 +41,7 @@ pub struct IpmiClient {
 
 impl IpmiClient {
     /// Create client and bind an ephemeral UDP socket.
+    /// Supports both IP addresses and hostnames (DNS resolution).
     pub async fn new(
         hostname: &str,
         username: &str,
@@ -45,10 +50,8 @@ impl IpmiClient {
         ipmb_channel: Option<u8>,
         ipmb_target: Option<u8>,
     ) -> Result<Self> {
+        let peer = resolve_host(hostname, IPMI_LANPLUS_PORT).await?;
         let local: SocketAddr = "0.0.0.0:0".parse().unwrap();
-        let peer: SocketAddr = format!("{}:{}", hostname, IPMI_LANPLUS_PORT)
-            .parse()
-            .map_err(|e: std::net::AddrParseError| IpmiError::Socket(e.to_string()))?;
         let sock = UdpSocket::bind(local)
             .await
             .map_err(|e| IpmiError::Socket(e.to_string()))?;
@@ -64,11 +67,13 @@ impl IpmiClient {
             sock,
             peer,
             out_seq: 0,
+            in_seq: 0,
             rq_seq: 0,
             bmc_id: [0; 4],
             console_id: [0; 4],
             bmc_rand: [0; 16],
             console_rand: [0; 16],
+            bmc_guid: [0; 16],
             sik: vec![],
             k1: vec![],
             k2: [0; 16],
@@ -90,8 +95,7 @@ impl IpmiClient {
         self.send(&open).await?;
 
         let data = self.recv(1024).await?;
-        debug!("recv data len={} bytes", data.len());
-        debug!("recv data hex={:02X?}", &data);
+        debug!("Open Session response len={}", data.len());
 
         if data.len() < 18 {
             error!("Bad response: length too short");
@@ -115,17 +119,33 @@ impl IpmiClient {
         // 2) RAKP1
         self.console_rand = rand_bytes_16();
         let rakp1 = codec::build_rakp1(&self.bmc_id, &self.console_rand, &self.username);
-        debug!("RAKP1 hex={:02X?}", rakp1);
         self.send(&rakp1).await?;
 
-        // 3) RAKP2
+        // 3) RAKP2 — verify BMC identity
         let data2 = self.recv(1024).await?;
-        debug!("RAKP2 hex={:02X?}", data2);
+        debug!("RAKP2 len={}", data2.len());
         if data2.len() < 18 || data2[17] != IPMI_RAKP_STATUS_NO_ERRORS {
             return Err(IpmiError::AuthFailed);
         }
         let off2 = IPMI_LANPLUS_HEADER_LEN;
         self.bmc_rand.copy_from_slice(&data2[off2 + 8..off2 + 24]);
+        self.bmc_guid.copy_from_slice(&data2[off2 + 24..off2 + 40]);
+        let digest_len = self.cipher.auth_digest_len();
+        let rakp2_auth_code = &data2[off2 + 40..off2 + 40 + digest_len];
+
+        // Verify RAKP2 auth code (BMC proves it knows the password)
+        codec::verify_rakp2(
+            &self.cipher,
+            &self.password,
+            &self.console_id,
+            &self.bmc_id,
+            &self.console_rand,
+            &self.bmc_rand,
+            &self.bmc_guid,
+            &self.username,
+            rakp2_auth_code,
+        )?;
+        debug!("RAKP2 auth code verified");
 
         // 4) RAKP3 + key derivation
         let (rakp3, sik, k1, k2) = codec::build_rakp3(
@@ -140,22 +160,43 @@ impl IpmiClient {
         self.sik = sik;
         self.k1 = k1;
         self.k2 = k2;
-        debug!("RAKP3 hex={:02X?}", rakp3);
         self.out_seq = self.out_seq.wrapping_add(1);
         self.send(&rakp3).await?;
 
-        // 5) RAKP4
+        // 5) RAKP4 — verify integrity check value
         let data4 = self.recv(1024).await?;
-        debug!("RAKP4 hex={:02X?}", data4);
+        debug!("RAKP4 len={}", data4.len());
         if data4.len() < 18 || data4[17] != IPMI_RAKP_STATUS_NO_ERRORS {
             return Err(IpmiError::AuthFailed);
         }
+        let off4 = IPMI_LANPLUS_HEADER_LEN;
+        let icv_len = match self.cipher.authentication {
+            crate::cipher::AuthAlg::HmacSha1 => 12,
+            crate::cipher::AuthAlg::HmacMd5 => 16,
+            crate::cipher::AuthAlg::HmacSha256 => 16,
+            crate::cipher::AuthAlg::None => 0,
+        };
+        if icv_len > 0 {
+            let rakp4_icv = &data4[off4 + 8..off4 + 8 + icv_len];
+            codec::verify_rakp4(
+                &self.cipher,
+                &self.sik,
+                &self.console_rand,
+                &self.bmc_id,
+                &self.bmc_guid,
+                rakp4_icv,
+            )?;
+            debug!("RAKP4 integrity check verified");
+        }
 
+        self.out_seq = 1;
+        self.in_seq = 0;
         self.established = true;
         Ok(())
     }
 
-    /// Send one IPMI command `[netfn, cmd, data...]`, return response payload.
+    /// Send one IPMI command `[netfn, cmd, data...]` with automatic retry.
+    /// Returns response payload.
     pub async fn request(&mut self, raw: &[u8]) -> Result<Vec<u8>> {
         if !self.established {
             return Err(IpmiError::InvalidState("session not established"));
@@ -167,15 +208,37 @@ impl IpmiClient {
             raw.to_vec()
         };
 
-        let msg = codec::build_v2_encrypted_msg(
-            &self.cipher, &raw, &self.bmc_id, self.out_seq, self.rq_seq, &self.k1, &self.k2,
-        )?;
-        self.out_seq = self.out_seq.wrapping_add(1);
-        self.rq_seq = self.rq_seq.wrapping_add(1);
-        self.send(&msg).await?;
+        for attempt in 0..MAX_RETRIES {
+            let msg = codec::build_v2_encrypted_msg(
+                &self.cipher, &raw, &self.bmc_id, self.out_seq, self.rq_seq, &self.k1, &self.k2,
+            )?;
+            self.send(&msg).await?;
 
-        let data = self.recv(4096).await?;
-        codec::decode_and_decrypt(&self.cipher, &data, &self.k1, &self.k2)
+            match self.recv(4096).await {
+                Ok(data) => {
+                    let (seq, payload) = codec::decode_and_decrypt(
+                        &self.cipher, &data, &self.k1, &self.k2,
+                    )?;
+                    // Validate sequence number
+                    if seq == 0 || (self.in_seq > 0 && seq <= self.in_seq.saturating_sub(SEQ_WINDOW)) {
+                        warn!("Sequence number replay detected: got={}, last={}", seq, self.in_seq);
+                        return Err(IpmiError::BadResponse);
+                    }
+                    if seq > self.in_seq {
+                        self.in_seq = seq;
+                    }
+                    self.out_seq = self.out_seq.wrapping_add(1);
+                    self.rq_seq = self.rq_seq.wrapping_add(1);
+                    return Ok(payload);
+                }
+                Err(IpmiError::Timeout) if attempt < MAX_RETRIES - 1 => {
+                    warn!("Timeout on attempt {}, retrying...", attempt + 1);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(IpmiError::Timeout)
     }
 
     /// Gracefully close the session.
@@ -197,6 +260,97 @@ impl IpmiClient {
         Ok(())
     }
 
+    /// Reconnect: close existing session (if any) and establish a new one.
+    pub async fn reconnect(&mut self) -> Result<()> {
+        let _ = self.close().await;
+        // Re-resolve DNS in case IP changed
+        let peer = resolve_host(&self.hostname, IPMI_LANPLUS_PORT).await?;
+        let local: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let sock = UdpSocket::bind(local)
+            .await
+            .map_err(|e| IpmiError::Socket(e.to_string()))?;
+        sock.connect(peer)
+            .await
+            .map_err(|e| IpmiError::Socket(e.to_string()))?;
+        self.sock = sock;
+        self.peer = peer;
+        self.out_seq = 0;
+        self.in_seq = 0;
+        self.rq_seq = 0;
+        self.connect().await
+    }
+
+    // --- High-level IPMI commands ---
+
+    /// Get Device ID (NetFn=App, Cmd=0x01)
+    pub async fn get_device_id(&mut self) -> Result<Vec<u8>> {
+        self.request(&[IPMI_NETFN_APP, 0x01]).await
+    }
+
+    /// Chassis Status (NetFn=Chassis 0x00, Cmd=0x01)
+    pub async fn get_chassis_status(&mut self) -> Result<Vec<u8>> {
+        self.request(&[0x00, 0x01]).await
+    }
+
+    /// Chassis Control (NetFn=Chassis 0x00, Cmd=0x02)
+    /// control: 0=off, 1=on, 2=cycle, 3=hard reset, 5=soft shutdown
+    pub async fn chassis_control(&mut self, control: u8) -> Result<Vec<u8>> {
+        self.request(&[0x00, 0x02, control]).await
+    }
+
+    /// Power On
+    pub async fn power_on(&mut self) -> Result<Vec<u8>> {
+        self.chassis_control(0x01).await
+    }
+
+    /// Power Off
+    pub async fn power_off(&mut self) -> Result<Vec<u8>> {
+        self.chassis_control(0x00).await
+    }
+
+    /// Power Cycle
+    pub async fn power_cycle(&mut self) -> Result<Vec<u8>> {
+        self.chassis_control(0x02).await
+    }
+
+    /// Hard Reset
+    pub async fn hard_reset(&mut self) -> Result<Vec<u8>> {
+        self.chassis_control(0x03).await
+    }
+
+    /// Soft Shutdown (ACPI)
+    pub async fn soft_shutdown(&mut self) -> Result<Vec<u8>> {
+        self.chassis_control(0x05).await
+    }
+
+    /// Get Sensor Reading (NetFn=SE 0x04, Cmd=0x2D)
+    pub async fn get_sensor_reading(&mut self, sensor_number: u8) -> Result<Vec<u8>> {
+        self.request(&[0x04, 0x2D, sensor_number]).await
+    }
+
+    /// Get SDR Repository Info (NetFn=Storage 0x0A, Cmd=0x20)
+    pub async fn get_sdr_repo_info(&mut self) -> Result<Vec<u8>> {
+        self.request(&[0x0A, 0x20]).await
+    }
+
+    /// Get SEL Info (NetFn=Storage 0x0A, Cmd=0x40)
+    pub async fn get_sel_info(&mut self) -> Result<Vec<u8>> {
+        self.request(&[0x0A, 0x40]).await
+    }
+
+    /// Get FRU Inventory Area Info (NetFn=Storage 0x0A, Cmd=0x10)
+    pub async fn get_fru_info(&mut self, fru_id: u8) -> Result<Vec<u8>> {
+        self.request(&[0x0A, 0x10, fru_id]).await
+    }
+
+    /// Set Boot Options - force PXE boot next (NetFn=Chassis 0x00, Cmd=0x08)
+    pub async fn set_boot_pxe(&mut self) -> Result<Vec<u8>> {
+        // Set boot flags: valid, PXE, persistent=no
+        self.request(&[0x00, 0x08, 0x05, 0x80, 0x04, 0x00, 0x00, 0x00]).await
+    }
+
+    // --- Internal helpers ---
+
     async fn send(&self, buf: &[u8]) -> Result<()> {
         self.sock.send(buf).await.map_err(|e| IpmiError::Socket(e.to_string()))?;
         Ok(())
@@ -212,4 +366,19 @@ impl IpmiClient {
         buf.truncate(n);
         Ok(buf)
     }
+}
+
+/// Resolve hostname (or IP string) to SocketAddr.
+async fn resolve_host(host: &str, port: u16) -> Result<SocketAddr> {
+    // Try direct parse first (for IP addresses)
+    if let Ok(addr) = format!("{}:{}", host, port).parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    // DNS lookup
+    let addr = lookup_host(format!("{}:{}", host, port))
+        .await
+        .map_err(|e| IpmiError::Socket(format!("DNS resolution failed: {}", e)))?
+        .next()
+        .ok_or_else(|| IpmiError::Socket("DNS returned no addresses".to_string()))?;
+    Ok(addr)
 }
