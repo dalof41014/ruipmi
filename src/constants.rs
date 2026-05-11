@@ -25,3 +25,8 @@ pub const IPMI_CMD_CLOSE_SESSION: u8 = 0x3C;
 
 pub const SESSION_AUTHTYPE_RMCP_PLUS: u8 = 0x06;
 pub const AES_BLOCK: usize = 16;
+
+pub const PAYLOAD_TYPE_SOL: u8 = 0x01;
+pub const IPMI_CMD_ACTIVATE_PAYLOAD: u8 = 0x48;
+pub const IPMI_CMD_DEACTIVATE_PAYLOAD: u8 = 0x49;
+pub const SOL_PAYLOAD_TYPE_NUM: u8 = 0x01;

@@ -93,6 +93,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `get_fru_info(id)` | Get FRU Inventory Area Info |
 | `set_boot_pxe()` | Set next boot to PXE |
 
+### SOL (Serial over LAN)
+
+| Method | Description |
+|--------|-------------|
+| `activate_sol()` | Activate SOL, returns `SolSession` |
+| `deactivate_sol()` | Deactivate SOL |
+| `sol_send(&mut sol, data)` | Send bytes to serial console |
+| `sol_recv(&mut sol)` | Receive bytes from serial console |
+
+### SOL (Serial over LAN)
+
+```rust
+use ruipmi::IpmiClient;
+
+let mut client = IpmiClient::new("host", "user", "pass", None, None, None).await?;
+client.connect().await?;
+
+// Activate SOL
+let mut sol = client.activate_sol().await?;
+
+// Send data to serial console
+client.sol_send(&mut sol, b"ls\r\n").await?;
+
+// Receive serial output
+let data = client.sol_recv(&mut sol).await?;
+println!("{}", String::from_utf8_lossy(&data));
+
+// Deactivate SOL
+client.deactivate_sol().await?;
+client.close().await?;
+```
+
 ### Custom Cipher Suite
 
 ```rust

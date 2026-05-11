@@ -5,7 +5,7 @@ use tokio::time::timeout;
 
 use log::{debug, error, warn};
 
-use crate::cipher::{CipherSuite, DEFAULT_CIPHER_SUITE};
+use crate::cipher::{CipherSuite, CryptAlg, DEFAULT_CIPHER_SUITE};
 use crate::codec;
 use crate::constants::*;
 use crate::crypto::{rand_bytes_4, rand_bytes_16};
@@ -13,6 +13,12 @@ use crate::error::{IpmiError, Result};
 
 const MAX_RETRIES: u8 = 3;
 const SEQ_WINDOW: u32 = 32;
+
+/// SOL session state, obtained from `activate_sol()`.
+pub struct SolSession {
+    sol_seq: u8,
+    ack_seq: u8,
+}
 
 pub struct IpmiClient {
     hostname: String,
@@ -347,6 +353,115 @@ impl IpmiClient {
     pub async fn set_boot_pxe(&mut self) -> Result<Vec<u8>> {
         // Set boot flags: valid, PXE, persistent=no
         self.request(&[0x00, 0x08, 0x05, 0x80, 0x04, 0x00, 0x00, 0x00]).await
+    }
+
+    // --- SOL (Serial over LAN) ---
+
+    /// Activate SOL payload. Returns a `SolSession` for sending/receiving serial data.
+    pub async fn activate_sol(&mut self) -> Result<SolSession> {
+        if !self.established {
+            return Err(IpmiError::InvalidState("session not established"));
+        }
+        // Deactivate any existing SOL session first (ignore errors)
+        let _ = self.request(&[
+            IPMI_NETFN_APP, IPMI_CMD_DEACTIVATE_PAYLOAD,
+            SOL_PAYLOAD_TYPE_NUM, 0x01,
+            0x00, 0x00, 0x00, 0x00,
+        ]).await;
+
+        // Activate Payload: NetFn=App(0x06), Cmd=0x48
+        // aux: bit7=encrypt, bit6=auth
+        let mut aux: u8 = 0x00;
+        if !matches!(self.cipher.confidentiality, CryptAlg::None) {
+            aux |= 0x80;
+        }
+        if !matches!(self.cipher.integrity, crate::cipher::IntegrityAlg::None) {
+            aux |= 0x40;
+        }
+        let resp = self.request(&[
+            IPMI_NETFN_APP, IPMI_CMD_ACTIVATE_PAYLOAD,
+            SOL_PAYLOAD_TYPE_NUM, 0x01,
+            aux, 0x00, 0x00, 0x00,
+        ]).await?;
+
+        if resp.is_empty() || resp[0] != 0x00 {
+            return Err(IpmiError::BadResponse);
+        }
+        debug!("SOL activated, response: {:02X?}", resp);
+
+        Ok(SolSession { sol_seq: 1, ack_seq: 0 })
+    }
+
+    /// Deactivate SOL payload.
+    pub async fn deactivate_sol(&mut self) -> Result<()> {
+        if !self.established {
+            return Ok(());
+        }
+        let resp = self.request(&[
+            IPMI_NETFN_APP, IPMI_CMD_DEACTIVATE_PAYLOAD,
+            SOL_PAYLOAD_TYPE_NUM, 0x01, // payload type=SOL, instance=1
+            0x00, 0x00, 0x00, 0x00,
+        ]).await?;
+        debug!("SOL deactivated: {:02X?}", resp);
+        Ok(())
+    }
+
+    /// Send data over SOL (serial console input).
+    pub async fn sol_send(&mut self, sol: &mut SolSession, data: &[u8]) -> Result<()> {
+        if !self.established {
+            return Err(IpmiError::InvalidState("session not established"));
+        }
+        let msg = codec::build_sol_packet(
+            &self.cipher, data, &self.bmc_id, self.out_seq,
+            sol.sol_seq, sol.ack_seq, 0, &self.k1, &self.k2,
+        )?;
+        self.send(&msg).await?;
+        self.out_seq = self.out_seq.wrapping_add(1);
+        sol.sol_seq = sol.sol_seq.wrapping_add(1);
+        if sol.sol_seq == 0 { sol.sol_seq = 1; } // seq 0 is reserved
+        Ok(())
+    }
+
+    /// Receive data from SOL (serial console output).
+    /// Returns the received bytes, or empty vec on timeout.
+    pub async fn sol_recv(&mut self, sol: &mut SolSession) -> Result<Vec<u8>> {
+        if !self.established {
+            return Err(IpmiError::InvalidState("session not established"));
+        }
+        let data = match self.recv(4096).await {
+            Ok(d) => d,
+            Err(IpmiError::Timeout) => return Ok(vec![]),
+            Err(e) => return Err(e),
+        };
+
+        let (payload_type, seq, raw) = codec::decode_v2_payload(
+            &self.cipher, &data, &self.k1, &self.k2,
+        )?;
+
+        if payload_type != PAYLOAD_TYPE_SOL {
+            // Not a SOL packet, ignore
+            return Ok(vec![]);
+        }
+
+        if seq > self.in_seq {
+            self.in_seq = seq;
+        }
+
+        let (bmc_seq, _ack_seq, _accepted, _status, sol_data) = codec::decode_sol_payload(&raw);
+
+        // Update ack tracking
+        if bmc_seq != 0 {
+            sol.ack_seq = bmc_seq;
+            // Send ACK (empty data packet with ack)
+            let ack = codec::build_sol_packet(
+                &self.cipher, &[], &self.bmc_id, self.out_seq,
+                0, sol.ack_seq, sol_data.len() as u8, &self.k1, &self.k2,
+            )?;
+            self.send(&ack).await?;
+            self.out_seq = self.out_seq.wrapping_add(1);
+        }
+
+        Ok(sol_data)
     }
 
     // --- Internal helpers ---

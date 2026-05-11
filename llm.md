@@ -169,6 +169,60 @@ match client.request(&[0x06, 0x01]).await {
 }
 ```
 
+## SOL (Serial over LAN)
+
+SOL provides remote serial console access to the server.
+
+```rust
+use ruipmi::{IpmiClient, SolSession};
+use std::time::Duration;
+
+let mut client = IpmiClient::new("bmc-host", "admin", "pass", None, None, None).await?;
+client.connect().await?;
+
+// Activate SOL (auto-deactivates any existing session)
+let mut sol = client.activate_sol().await?;
+
+// Send command to serial console
+client.sol_send(&mut sol, b"whoami\r\n").await?;
+
+// Receive output (returns empty vec on timeout, not an error)
+tokio::time::sleep(Duration::from_millis(500)).await;
+let output = client.sol_recv(&mut sol).await?;
+println!("{}", String::from_utf8_lossy(&output));
+
+// Interactive loop pattern
+loop {
+    let data = client.sol_recv(&mut sol).await?;
+    if !data.is_empty() {
+        print!("{}", String::from_utf8_lossy(&data));
+    }
+    // Send user input...
+    // client.sol_send(&mut sol, user_input).await?;
+}
+
+// Cleanup
+client.deactivate_sol().await?;
+client.close().await?;
+```
+
+### SOL API
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `activate_sol` | `async fn activate_sol(&mut self) -> Result<SolSession>` | Start SOL session |
+| `deactivate_sol` | `async fn deactivate_sol(&mut self) -> Result<()>` | End SOL session |
+| `sol_send` | `async fn sol_send(&mut self, sol: &mut SolSession, data: &[u8]) -> Result<()>` | Send bytes to console |
+| `sol_recv` | `async fn sol_recv(&mut self, sol: &mut SolSession) -> Result<Vec<u8>>` | Receive bytes (empty = timeout) |
+
+### SOL Notes
+
+- `sol_recv()` returns `Ok(vec![])` on timeout — this is normal, not an error
+- SOL uses the same encrypted channel as IPMI commands
+- `activate_sol()` automatically deactivates any existing SOL session first
+- Send `\r\n` to trigger a login prompt or command output
+- The `SolSession` tracks sequence numbers for ACK/NACK flow control
+
 ## Common NetFn Values
 
 | NetFn | Name | Common Commands |

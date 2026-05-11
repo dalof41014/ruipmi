@@ -346,3 +346,138 @@ fn ipmi_checksum(buf: &[u8]) -> u8 {
 fn ipmb_checksum(data: &[u8]) -> u8 {
     ((256u16 - (data.iter().fold(0u16, |a, &b| a + b as u16) % 256)) % 256) as u8
 }
+
+/// Build SOL data packet (payload type 0x01).
+pub fn build_sol_packet(
+    cipher: &CipherSuite,
+    data: &[u8],
+    bmc_id: &[u8; 4],
+    out_seq: u32,
+    sol_seq: u8,
+    ack_seq: u8,
+    accepted_chars: u8,
+    k1: &[u8],
+    k2: &[u8; 16],
+) -> Result<Vec<u8>> {
+    // SOL payload: [seq, ack_seq, accepted_chars, operation/status, data...]
+    let mut payload = Vec::with_capacity(4 + data.len());
+    payload.push(sol_seq);       // packet sequence number
+    payload.push(ack_seq);       // ack/nack sequence number
+    payload.push(accepted_chars); // accepted character count
+    payload.push(0x00);          // operation: no flush, no break, no CTS/DCD/DSR
+    payload.extend_from_slice(data);
+
+    let mut hdr = vec![0u8; IPMI_LANPLUS_HEADER_LEN];
+    hdr[0] = RMCP_VERSION_1;
+    hdr[2] = 0xFF;
+    hdr[3] = RMCP_CLASS_IPMI;
+    hdr[OFF_AUTHTYPE] = SESSION_AUTHTYPE_RMCP_PLUS;
+
+    let encrypt_bit = match cipher.confidentiality {
+        CryptAlg::None => 0x00,
+        _ => 0x80,
+    };
+    let auth_bit = match cipher.integrity {
+        IntegrityAlg::None => 0x00,
+        _ => 0x40,
+    };
+    hdr[OFF_PAYLOAD_TYPE] = PAYLOAD_TYPE_SOL | encrypt_bit | auth_bit;
+    hdr[OFF_SESSION_ID..OFF_SESSION_ID + 4].copy_from_slice(bmc_id);
+    hdr[OFF_SEQUENCE_NUM..OFF_SEQUENCE_NUM + 4].copy_from_slice(&out_seq.to_le_bytes());
+
+    let enc = encrypt(cipher, &payload, k2)?;
+
+    let mut msg = hdr;
+    msg.extend_from_slice(&enc);
+
+    let plen = enc.len();
+    msg[OFF_PAYLOAD_SIZE] = (plen & 0xFF) as u8;
+    msg[OFF_PAYLOAD_SIZE + 1] = ((plen >> 8) & 0xFF) as u8;
+
+    // Integrity padding + HMAC
+    let length_before_auth = 12 + plen + 2;
+    let pad_size = (4 - (length_before_auth % 4)) % 4;
+    if pad_size > 0 {
+        msg.extend(std::iter::repeat(0xFF).take(pad_size));
+    }
+    msg.push(pad_size as u8);
+    msg.push(0x07);
+
+    let to_auth = &msg[OFF_AUTHTYPE..];
+    let mut auth = hmac_integrity(cipher, k1, to_auth);
+    auth.truncate(cipher.integrity_truncate_len());
+    msg.extend_from_slice(&auth);
+
+    Ok(msg)
+}
+
+/// Decode SOL response payload. Returns (sol_seq, ack_seq, accepted_chars, status, data).
+pub fn decode_sol_payload(decrypted: &[u8]) -> (u8, u8, u8, u8, Vec<u8>) {
+    if decrypted.len() < 4 {
+        return (0, 0, 0, 0, vec![]);
+    }
+    let sol_seq = decrypted[0];
+    let ack_seq = decrypted[1];
+    let accepted = decrypted[2];
+    let status = decrypted[3];
+    let data = decrypted[4..].to_vec();
+    (sol_seq, ack_seq, accepted, status, data)
+}
+
+/// Decode an incoming SOL or IPMI v2 packet. Returns (payload_type, sequence_number, raw_decrypted_payload).
+pub fn decode_v2_payload(
+    cipher: &CipherSuite,
+    data: &[u8],
+    k1: &[u8],
+    k2: &[u8; 16],
+) -> Result<(u8, u32, Vec<u8>)> {
+    if data.get(OFF_AUTHTYPE).copied() != Some(SESSION_AUTHTYPE_RMCP_PLUS) {
+        return Err(IpmiError::BadResponse);
+    }
+
+    let payload_type_raw = data.get(OFF_PAYLOAD_TYPE).copied().unwrap_or(0);
+    let payload_type = payload_type_raw & 0x3F;
+
+    let auth_len = cipher.integrity_truncate_len();
+    if data.len() < auth_len + IPMI_LANPLUS_HEADER_LEN {
+        return Err(IpmiError::BadResponse);
+    }
+
+    // Verify HMAC
+    let auth_recv = &data[data.len() - auth_len..];
+    let to_auth = &data[OFF_AUTHTYPE..data.len() - auth_len];
+    let mut auth_calc = hmac_integrity(cipher, k1, to_auth);
+    auth_calc.truncate(auth_len);
+    if auth_calc != auth_recv {
+        return Err(IpmiError::AuthFailed);
+    }
+
+    let seq = u32::from_le_bytes([
+        data[OFF_SEQUENCE_NUM],
+        data[OFF_SEQUENCE_NUM + 1],
+        data[OFF_SEQUENCE_NUM + 2],
+        data[OFF_SEQUENCE_NUM + 3],
+    ]);
+
+    let msglen = (data[OFF_PAYLOAD_SIZE] as usize) | ((data[OFF_PAYLOAD_SIZE + 1] as usize) << 8);
+    let enc = &data[IPMI_LANPLUS_HEADER_LEN..IPMI_LANPLUS_HEADER_LEN + msglen];
+    let dec = decrypt(cipher, enc, k2)?;
+
+    // Strip confidentiality padding for encrypted payloads
+    let raw = match cipher.confidentiality {
+        CryptAlg::None => dec,
+        _ => {
+            if dec.is_empty() {
+                return Err(IpmiError::DecryptFailed);
+            }
+            let pad_len = *dec.last().unwrap() as usize;
+            if dec.len() < pad_len + 1 {
+                return Err(IpmiError::DecryptFailed);
+            }
+            let payload_size = dec.len() - pad_len - 1;
+            dec[..payload_size].to_vec()
+        }
+    };
+
+    Ok((payload_type, seq, raw))
+}
