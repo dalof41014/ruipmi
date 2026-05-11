@@ -190,7 +190,9 @@ impl IpmiClient {
         )?;
         self.out_seq = self.out_seq.wrapping_add(1);
         self.rq_seq = self.rq_seq.wrapping_add(1);
-        let _ = self.send(&msg).await;
+        if self.send(&msg).await.is_ok() {
+            let _ = self.recv(1024).await;
+        }
         self.established = false;
         Ok(())
     }
