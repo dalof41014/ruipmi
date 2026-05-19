@@ -56,6 +56,7 @@ pub fn build_rakp1(
 
 /// Verify RAKP2 auth code from BMC.
 /// HMAC(password, SIDm || SIDc || Rm || Rc || GUIDc || ROLEm || ULENm || UNAMEm)
+#[allow(clippy::too_many_arguments)]
 pub fn verify_rakp2(
     cipher: &CipherSuite,
     password: &[u8],
@@ -121,6 +122,7 @@ pub fn verify_rakp4(
 
 /// Build RAKP Message 3 and derive session keys (SIK, K1, K2).
 /// Returns (rakp3_packet, sik, k1, k2).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn build_rakp3(
     cipher: &CipherSuite,
     password: &[u8],
@@ -216,7 +218,7 @@ pub fn build_v2_encrypted_msg(
     let length_before_auth = 12 + plen + 2;
     let pad_size = (4 - (length_before_auth % 4)) % 4;
     if pad_size > 0 {
-        msg.extend(std::iter::repeat(0xFF).take(pad_size));
+        msg.extend(vec![0xFF; pad_size]);
     }
     msg.push(pad_size as u8);
     msg.push(0x07);
@@ -348,6 +350,7 @@ fn ipmb_checksum(data: &[u8]) -> u8 {
 }
 
 /// Build SOL data packet (payload type 0x01).
+#[allow(clippy::too_many_arguments)]
 pub fn build_sol_packet(
     cipher: &CipherSuite,
     data: &[u8],
@@ -398,7 +401,7 @@ pub fn build_sol_packet(
     let length_before_auth = 12 + plen + 2;
     let pad_size = (4 - (length_before_auth % 4)) % 4;
     if pad_size > 0 {
-        msg.extend(std::iter::repeat(0xFF).take(pad_size));
+        msg.extend(vec![0xFF; pad_size]);
     }
     msg.push(pad_size as u8);
     msg.push(0x07);

@@ -53,11 +53,12 @@ pub fn parse_fru_board_info(data: &[u8], header: &FruCommonHeader) -> Option<Fru
 
     // Skip: format version (1), area length (1), language (1), mfg date (3)
     let mut pos = offset + 6;
-    let mut info = FruBoardInfo::default();
-    info.manufacturer = decode_fru_field(data, &mut pos).unwrap_or_default();
-    info.product_name = decode_fru_field(data, &mut pos).unwrap_or_default();
-    info.serial_number = decode_fru_field(data, &mut pos).unwrap_or_default();
-    info.part_number = decode_fru_field(data, &mut pos).unwrap_or_default();
+    let info = FruBoardInfo {
+        manufacturer: decode_fru_field(data, &mut pos).unwrap_or_default(),
+        product_name: decode_fru_field(data, &mut pos).unwrap_or_default(),
+        serial_number: decode_fru_field(data, &mut pos).unwrap_or_default(),
+        part_number: decode_fru_field(data, &mut pos).unwrap_or_default(),
+    };
     Some(info)
 }
 
@@ -69,13 +70,14 @@ pub fn parse_fru_product_info(data: &[u8], header: &FruCommonHeader) -> Option<F
 
     // Skip: format version (1), area length (1), language (1)
     let mut pos = offset + 3;
-    let mut info = FruProductInfo::default();
-    info.manufacturer = decode_fru_field(data, &mut pos).unwrap_or_default();
-    info.product_name = decode_fru_field(data, &mut pos).unwrap_or_default();
-    info.part_number = decode_fru_field(data, &mut pos).unwrap_or_default();
-    info.version = decode_fru_field(data, &mut pos).unwrap_or_default();
-    info.serial_number = decode_fru_field(data, &mut pos).unwrap_or_default();
-    info.asset_tag = decode_fru_field(data, &mut pos).unwrap_or_default();
+    let info = FruProductInfo {
+        manufacturer: decode_fru_field(data, &mut pos).unwrap_or_default(),
+        product_name: decode_fru_field(data, &mut pos).unwrap_or_default(),
+        part_number: decode_fru_field(data, &mut pos).unwrap_or_default(),
+        version: decode_fru_field(data, &mut pos).unwrap_or_default(),
+        serial_number: decode_fru_field(data, &mut pos).unwrap_or_default(),
+        asset_tag: decode_fru_field(data, &mut pos).unwrap_or_default(),
+    };
     Some(info)
 }
 
