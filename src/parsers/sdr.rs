@@ -79,8 +79,8 @@ pub fn parse_sdr_header(data: &[u8]) -> Option<SdrHeader> {
 /// Parse an SDR record body (after the 5-byte header).
 pub fn parse_sdr_record(header: &SdrHeader, body: &[u8]) -> SdrRecord {
     match header.record_type {
-        0x01 if body.len() >= 41 => parse_full_sensor(body),
-        0x02 if body.len() >= 25 => parse_compact_sensor(body),
+        0x01 if body.len() >= 43 => parse_full_sensor(body),
+        0x02 if body.len() >= 27 => parse_compact_sensor(body),
         t => SdrRecord::Unknown(t),
     }
 }
@@ -116,16 +116,16 @@ fn parse_full_sensor(body: &[u8]) -> SdrRecord {
     let b_exp = sign4(body[24] & 0x0F);
 
     let threshold = SdrThreshold {
-        upper_non_recover: body[34],
-        upper_critical: body[35],
-        upper_non_critical: body[36],
-        lower_non_recover: body[37],
-        lower_critical: body[38],
-        lower_non_critical: body[39],
+        upper_non_recover: body[31],
+        upper_critical: body[32],
+        upper_non_critical: body[33],
+        lower_non_recover: body[34],
+        lower_critical: body[35],
+        lower_non_critical: body[36],
     };
 
-    let id_code = body[40];
-    let id_bytes = &body[41..];
+    let id_code = body[42];
+    let id_bytes = &body[43..];
     let name = super::decode_id_string(id_code, id_bytes);
 
     SdrRecord::Full(SdrFullSensor {
@@ -142,8 +142,8 @@ fn parse_full_sensor(body: &[u8]) -> SdrRecord {
 
 fn parse_compact_sensor(body: &[u8]) -> SdrRecord {
     let common = parse_common_sensor(body);
-    let id_code = body[24];
-    let id_bytes = &body[25..];
+    let id_code = body[26];
+    let id_bytes = &body[27..];
     let name = super::decode_id_string(id_code, id_bytes);
     SdrRecord::Compact(SdrCompactSensor { common, name })
 }
